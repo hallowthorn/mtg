@@ -418,19 +418,41 @@ table.odds th{color:var(--muted);font-weight:500}
 /* ================= Scryfall API ================= */
 const API = "https://api.scryfall.com";
 let lastCall = 0;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+/* Scryfall asks for gentle traffic: requests are spaced out, and a dropped connection,
+   "too many requests" (429) or a server hiccup is retried a few times before giving up. */
 async function api(path, opts = {}) {
-  const wait = Math.max(0, lastCall + 110 - Date.now());
-  lastCall = Date.now() + wait;
-  if (wait) await new Promise(r => setTimeout(r, wait));
-  const res = await fetch(path.startsWith("http") ? path : API + path, {
-    method: opts.method || "GET", body: opts.body,
-    headers: opts.body ? { "Content-Type": "application/json" } : undefined
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok && res.status !== 404) throw new Error(data.details || ("Scryfall error " + res.status));
-  return { status: res.status, data };
+  let lastErr = null;
+  const BACKOFF = [600, 1600];
+  for (let attempt = 0; attempt <= BACKOFF.length; attempt++) {
+    if (attempt && lastErr) await sleep(Math.max(lastErr.retryAfter || 0, BACKOFF[attempt - 1]));
+    const wait = Math.max(0, lastCall + 120 - Date.now());
+    lastCall = Date.now() + wait;
+    if (wait) await sleep(wait);
+    let res;
+    try {
+      res = await fetch(path.startsWith("http") ? path : API + path, {
+        method: opts.method || "GET", body: opts.body,
+        headers: opts.body ? { "Content-Type": "application/json" } : undefined
+      });
+    } catch (e) { lastErr = Object.assign(new Error("No response from Scryfall"), { kind: "network" }); continue; }
+    if (res.status === 429 || res.status >= 500) {
+      lastErr = Object.assign(new Error(`Scryfall answered ${res.status}`), { kind: res.status === 429 ? "rate" : "server", retryAfter: Math.min(5000, (+res.headers.get("Retry-After") || 0) * 1000) });
+      continue;
+    }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok && res.status !== 404 && res.status !== 400) throw Object.assign(new Error(data.details || ("Scryfall error " + res.status)), { kind: "server" });
+    return { status: res.status, data };
+  }
+  throw lastErr;
 }
-const NET_HELP = `Card data comes from Scryfall over the internet. If you opened this inside another app's preview, open the file directly in Chrome, Edge or Firefox instead (double-click <b>deckforge.html</b> in File Explorer).`;
+/* Plain-language reason when Scryfall can't be used, matched to how the page was opened. */
+function netError(e) {
+  if (e && e.kind === "rate") return "Scryfall, the card database, is getting too many requests right now. Wait a few seconds, then try again.";
+  if (e && e.kind === "server") return `Scryfall, the card database, had a problem (${e.message}). Try again in a moment.`;
+  if (location.protocol === "file:") return "Can't reach Scryfall, the card database. Check your internet connection. If you opened this inside another app's preview, open deckforge.html directly in Chrome or Edge.";
+  return "Can't reach Scryfall, the card database. Check your internet connection. If you use an ad blocker or privacy extension (uBlock Origin, Brave Shields, Privacy Badger), allow api.scryfall.com on this site, then reload.";
+}
 
 /* ================= Card model ================= */
 function slim(c) {
@@ -565,7 +587,7 @@ function validate(d) {
 
 /* ================= Shared DOM helpers ================= */
 const $ = s => document.querySelector(s);
-let tt; function toast(msg) { const t = $("#toast"); t.innerHTML = msg; t.hidden = false; clearTimeout(tt); tt = setTimeout(() => t.hidden = true, 2800); }
+let tt; function toast(msg, ms = 2800) { const t = $("#toast"); t.innerHTML = msg; t.hidden = false; clearTimeout(tt); tt = setTimeout(() => t.hidden = true, ms); }
 function modal(html, setup) {
   const root = $("#modalRoot");
   root.innerHTML = `<div class="modal"><div class="box" role="dialog" aria-modal="true">${html}</div></div>`;
@@ -731,7 +753,7 @@ async function doSearch(url) {
     renderResults(data.total_cards);
   } catch (e) {
     if (seq !== searchSeq) return;
-    $("#results").innerHTML = `<div class="err" style="grid-column:1/-1"><b>Can't reach Scryfall.</b><br>${NET_HELP}<br><small style="color:var(--muted)">${esc(e.message)}</small></div>`;
+    $("#results").innerHTML = `<div class="err" style="grid-column:1/-1"><b>Card search didn't load.</b><br>${esc(netError(e))}<br><button class="btn sm" style="margin-top:8px" onclick="doSearch()">Try again</button></div>`;
   }
 }
 let lastTotal = 0;
@@ -1493,7 +1515,7 @@ $("#importBtn").onclick = () => modal(`<h3>Import a decklist</h3>
       if (d.entries.some(e => e.board === "cmd") && !isCmdr(d.format)) d.format = "commander";
       save(); pt = null; closeModal(); renderAll(); setMode("build");
       toast(miss.length ? `Imported. Couldn't find: ${esc(miss.slice(0, 4).join(", "))}${miss.length > 4 ? "…" : ""}` : "Deck imported");
-    } catch (e) { btn.disabled = false; btn.textContent = "Import"; toast("Can't reach Scryfall to look up cards. Open the file directly in your browser."); }
+    } catch (e) { btn.disabled = false; btn.textContent = "Import"; toast(esc(netError(e)), 7000); }
   };
 });
 function exportText(d) {
@@ -1522,7 +1544,9 @@ PRESETS.push({ id: "commander:Krenko Goblins", fmt: "commander", name: "Krenko G
   list: "Commander\n1 Krenko, Mob Boss\n\nDeck\n1 Goblin Chieftain\n1 Goblin King\n1 Goblin Warchief\n1 Goblin Rabblemaster\n1 Legion Warboss\n1 Krenko, Tin Street Kingpin\n1 Siege-Gang Commander\n1 Beetleback Chief\n1 Mogg War Marshal\n1 Goblin Instigator\n1 Goblin Ringleader\n1 Goblin Matron\n1 Skirk Prospector\n1 Goblin Piledriver\n1 Goblin Motivator\n1 Mogg Fanatic\n1 Goblin Bushwhacker\n1 Battle Cry Goblin\n1 Goblin Trashmaster\n1 Muxus, Goblin Grandee\n1 Goblin Dark-Dwellers\n1 Goblin Cratermaker\n1 Moggcatcher\n1 Hobgoblin Bandit Lord\n1 Legion Loyalist\n1 Pashalik Mons\n1 Purphoros, God of the Forge\n1 Gempalm Incinerator\n1 Tilonalli's Summoner\n1 Ogre Battledriver\n1 Hellrider\n1 Hordeling Outburst\n1 Dragon Fodder\n1 Krenko's Command\n1 Goblin Rally\n1 Goblin War Strike\n1 Goblin Grenade\n1 Mob Rule\n1 Impact Tremors\n1 Shared Animosity\n1 Coat of Arms\n1 Goblin Bombardment\n1 Throne of the God-Pharaoh\n1 Outpost Siege\n1 Valakut Exploration\n1 Lightning Greaves\n1 Swiftfoot Boots\n1 Sol Ring\n1 Arcane Signet\n1 Mind Stone\n1 Fire Diamond\n1 Coldsteel Heart\n1 Thought Vessel\n1 Ruby Medallion\n1 Wayfarer's Bauble\n1 Lightning Bolt\n1 Abrade\n1 Chaos Warp\n1 Fiery Confluence\n1 Blasphemous Act\n1 Vandalblast\n1 Faithless Looting\n1 Thrill of Possibility\n1 Wheel of Misfortune\n1 Rogue's Passage\n1 Castle Embereth\n1 Den of the Bugbear\n1 Myriad Landscape\n31 Mountain" });
 PRESETS.push({ id: "commander:Witherbloom, the Balancer", fmt: "commander", name: "Witherbloom Tokens", meta: "", key: "Witherbloom, the Balancer", ev: "EDHREC average of about 18,000 Witherbloom decks · go wide with tokens, then cast huge X spells for almost nothing", date: "", pilot: "EDHREC", rank: 2, casual: true,
   list: "Commander\n1 Witherbloom, the Balancer\n\nDeck\n1 Arcane Signet\n1 Lightning Greaves\n1 Skullclamp\n1 Sol Ring\n1 Bojuka Bog\n1 Command Tower\n1 Deathcap Glade\n1 Dryad Arbor\n10 Forest\n1 Llanowar Wastes\n1 Necroblossom Snarl\n1 Overgrown Tomb\n9 Swamp\n1 Tainted Wood\n1 Twilight Mire\n1 Undergrowth Stadium\n1 Urborg, Tomb of Yawgmoth\n1 Verdant Catacombs\n1 Vernal Fen\n1 Wastewood Verge\n1 Woodland Cemetery\n1 Yavimaya, Cradle of Growth\n1 Arasta of the Endless Web\n1 Arbor Elf\n1 Badgermole Cub\n1 Beledros Witherbloom\n1 Birds of Paradise\n1 Bitterbloom Bearer\n1 Chatterfang, Squirrel General\n1 Craterhoof Behemoth\n1 Delighted Halfling\n1 Elves of Deep Shadow\n1 Elvish Mystic\n1 Enduring Vitality\n1 Eternal Witness\n1 Fyndhorn Elves\n1 Llanowar Elves\n1 Mirkwood Bats\n1 Scute Swarm\n1 Sedgemoor Witch\n1 Stensian Sanguinist\n1 Studious First-Year\n1 Tendershoot Dryad\n1 Witherbloom Apprentice\n1 Bitterblossom\n1 Cryptolith Rite\n1 Parallel Lives\n1 Springleaf Parade\n1 Arachnogenesis\n1 Assassin's Trophy\n1 Beast Within\n1 Chord of Calling\n1 Dark Ritual\n1 Heroic Intervention\n1 Return of the Wildspeaker\n1 Second Harvest\n1 Sprout Swarm\n1 Stinging Study\n1 Szat's Will\n1 Veil of Summer\n1 Animist's Awakening\n1 Army of the Damned\n1 Awaken the Woods\n1 Biorhythm\n1 Collective Unconscious\n1 Cultivate\n1 Damnable Pact\n1 Diabolic Revelation\n1 Exsanguinate\n1 Ezuri's Predation\n1 Finale of Devastation\n1 For the Common Good\n1 Gelatinous Genesis\n1 Green Sun's Zenith\n1 In Garruk's Wake\n1 Lab Rats\n1 Nature's Rhythm\n1 Pest Infestation\n1 Rise of the Dark Realms\n1 Shamanic Revelation\n1 Sylvan Offering\n1 Torment of Hailfire" });
-const artUrl = name => "https://api.scryfall.com/cards/named?format=image&version=art_crop&exact=" + encodeURIComponent(name);
+/* Gallery art comes straight from Scryfall's image server (no API calls, no rate limit). */
+const PRESET_ART = {"Sunderflock": "https://cards.scryfall.io/art_crop/front/e/5/e5b6221e-cb22-45e4-bb98-2b960afc614c.jpg?1783904481", "Kaito, Bane of Nightmares": "https://cards.scryfall.io/art_crop/front/5/5/55a14f30-4ff9-4472-90a6-c3139f1c18e5.jpg?1784963190", "Amalia Benavides Aguirre": "https://cards.scryfall.io/art_crop/front/9/a/9acf80a5-f2ca-45b4-aca8-fbc690e35401.jpg?1783913735", "Icetill Explorer": "https://cards.scryfall.io/art_crop/front/d/9/d9482aab-6ddf-48e1-84fa-b13d5ff81e69.jpg?1783905935", "Slickshot Show-Off": "https://cards.scryfall.io/art_crop/front/7/0/7054012b-4f9d-44a0-aaf9-7fd3bddc7b2d.jpg?1783911814", "Erode": "https://cards.scryfall.io/art_crop/front/3/2/32e670da-7563-4f6a-a7db-4c126a440eb8.jpg?1783903705", "Smaug the Magnificent": "https://cards.scryfall.io/art_crop/front/6/a/6a5d8fad-2ffd-4645-8c49-907999b6cecf.jpg?1783902784", "Inevitable Defeat": "https://cards.scryfall.io/art_crop/front/9/d/9d677980-b608-407e-9f17-790a81263f15.jpg?1783907309", "Deceit": "https://cards.scryfall.io/art_crop/front/b/d/bd82c9e4-9871-4e6d-b691-ee00b4b9a3c6.jpg?1783904420", "Simulacrum Synthesizer": "https://cards.scryfall.io/art_crop/front/a/a/aaa05ad1-5cda-4edd-b6bf-562ae3e5011a.jpg?1783912002", "Quantum Riddler": "https://cards.scryfall.io/art_crop/front/1/2/120be808-ff3b-4fca-96a1-4db6b9825856.jpg?1783905977", "Iridescent Vinelasher": "https://cards.scryfall.io/art_crop/front/b/2/b2bc854c-4e72-48e0-a098-e3451d6e511d.jpg?1783910833", "Kessig Flamebreather": "https://cards.scryfall.io/art_crop/front/3/0/303ad78a-b02a-44dc-afe6-7f95781a5062.jpg?1783924832", "Tolarian Terror": "https://cards.scryfall.io/art_crop/front/2/5/2569d4f3-55ed-4f99-9592-34c7df0aab72.jpg?1783909076", "Llanowar Elves": "https://cards.scryfall.io/art_crop/front/6/a/6a0b230b-d391-4998-a3f7-7b158a0ec2cd.jpg?1783909057", "Moment's Peace": "https://cards.scryfall.io/art_crop/front/4/0/40ebe935-ccf9-435e-8fe8-53bcbf3526e7.jpg?1783945215", "Spellstutter Sprite": "https://cards.scryfall.io/art_crop/front/3/8/3899605d-2203-4ab6-9ff5-69490382eea4.jpg?1783939994", "Utrom Monitor": "https://cards.scryfall.io/art_crop/front/8/c/8ce6647c-343a-45e8-9b6e-0292ae01ec81.jpg?1783904138", "Balustrade Spy": "https://cards.scryfall.io/art_crop/front/2/4/24c852a5-4f38-464b-89b6-2100cf405ff5.jpg?1783913329", "Slippery Bogle": "https://cards.scryfall.io/art_crop/front/c/4/c4e4bbea-7e3f-4de0-bb01-dfd67f21c254.jpg?1783933766", "Rally at the Hornburg": "https://cards.scryfall.io/art_crop/front/e/e/ee7292f7-1c7e-449c-9c52-7584d6a14c2c.jpg?1783916278", "Glint Hawk": "https://cards.scryfall.io/art_crop/front/2/8/284c4710-4183-4743-9c8b-515cc98cbbb8.jpg?1783941745", "Cleansing Wildfire": "https://cards.scryfall.io/art_crop/front/4/9/492d77e5-acc6-41b8-8930-f39d69234919.jpg?1783929361", "Snuff Out": "https://cards.scryfall.io/art_crop/front/7/5/75bbe89f-09af-494e-b58e-271f64bde4b5.jpg?1783938751", "Sowing Mycospawn": "https://cards.scryfall.io/art_crop/front/c/d/cdfadb17-76ad-4d4d-9fa7-33c4b88b4c0a.jpg?1783911255", "Emrakul, the Promised End": "https://cards.scryfall.io/art_crop/front/7/1/71911392-42b0-4b6d-baf7-918a4bd3b924.jpg?1783908188", "Kappa Cannoneer": "https://cards.scryfall.io/art_crop/front/9/9/99cd996f-be74-4dbb-9460-6d650cedfca6.jpg?1783906043", "Scion of Draco": "https://cards.scryfall.io/art_crop/front/3/e/3e7da55c-7f05-46b2-aa3c-17f8d5df46bb.jpg?1783926802", "Ajani, Nacatl Pariah": "https://cards.scryfall.io/art_crop/front/0/d/0d16e8e0-31b2-4389-afd6-783c501f6fa0.jpg?1791803778", "Ocelot Pride": "https://cards.scryfall.io/art_crop/front/8/9/89cf6f57-230f-497e-a14e-ad1e8737fd42.jpg?1783911298", "Atraxa, Grand Unifier": "https://cards.scryfall.io/art_crop/front/4/a/4a1f905f-1d55-4d02-9d24-e58070793d3f.jpg?1783918003", "Teferi, Time Raveler": "https://cards.scryfall.io/art_crop/front/6/6/662fe50f-d75c-422c-8c6c-1f9b5c4ba21f.jpg?1783913271", "Ruby Medallion": "https://cards.scryfall.io/art_crop/front/6/3/630febf5-58ff-4dab-a5a8-575ebc5435a6.jpg?1783911209", "Basking Broodscale": "https://cards.scryfall.io/art_crop/front/5/f/5feba5d6-99a6-4e9b-8a7d-90d955868fc3.jpg?1783911263", "Krenko, Mob Boss": "https://cards.scryfall.io/art_crop/front/8/2/824b2d73-2151-4e5e-9f05-8f63e2bdcaa9.jpg?1783909065", "Witherbloom, the Balancer": "https://cards.scryfall.io/art_crop/front/e/d/ed7b2361-97c6-49e2-bf0b-4770f4ffe2f0.jpg?1783903624"};
+const artUrl = name => PRESET_ART[name] || "https://api.scryfall.com/cards/named?format=image&version=art_crop&exact=" + encodeURIComponent(name);
 
 async function loadPreset(p) {
   const existing = state.decks.find(d => d.presetId === p.id);
@@ -1568,7 +1592,7 @@ function openGallery() {
       const p = PRESETS.find(x => x.id === t.dataset.id);
       t.classList.add("busy");
       try { await loadPreset(p); closeModal(); }
-      catch (err) { t.classList.remove("busy"); toast("Can't reach Scryfall to load the cards. Open the file directly in Chrome or Edge."); }
+      catch (err) { t.classList.remove("busy"); toast(esc(netError(err)), 7000); }
     });
   });
 }
@@ -1582,7 +1606,7 @@ async function boot() {
     firstRun = true;
     $("#results").innerHTML = `<div class="loading"><div class="spin"></div>Loading the #1 Pauper deck from Scryfall…</div>`;
     try { await loadPreset(PRESETS.find(p => p.fmt === "pauper")); }
-    catch (e) { newDeck("My deck", "standard"); renderAll(); $("#results").innerHTML = `<div class="err" style="grid-column:1/-1"><b>Can't reach Scryfall.</b><br>${NET_HELP}</div>`; return; }
+    catch (e) { newDeck("My deck", "standard"); renderAll(); $("#results").innerHTML = `<div class="err" style="grid-column:1/-1"><b>Couldn't load the starter deck.</b><br>${esc(netError(e))}<br><button class="btn sm" style="margin-top:8px" onclick="location.reload()">Reload</button></div>`; return; }
   }
   if (!deck()) state.current = state.decks[0].id;
   renderAll();
